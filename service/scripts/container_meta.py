@@ -2005,8 +2005,71 @@ def _zip_namelist(data: bytes) -> list[str]:
 
 
 def _is_docx_meta_part(name: str) -> bool:
-    """Return True for DOCX/XLSX/PPTX parts that carry provenance, not visible content."""
-    return name.startswith(("docProps/", "customXml/"))
+    """Return True for OOXML parts that carry provenance or add-in state."""
+    low = name.lower()
+    return low.startswith(("docprops/", "customxml/")) or _is_ooxml_webextension_part(name)
+
+
+def _is_ooxml_webextension_part(name: str) -> bool:
+    """True for Office add-in metadata parts in Word, Excel, and PowerPoint."""
+    return bool(re.match(r"^(?:word|xl|ppt)/webextensions/", name, re.I))
+
+
+def office_owner_file(path: Path) -> Path | None:
+    """Return a sibling Office owner file that suggests the document is open."""
+    if not path.name:
+        return None
+    names = [f"~${path.name}"]
+    if len(path.name) > 2:
+        names.append(f"~${path.name[2:]}")
+    for name in dict.fromkeys(names):
+        candidate = path.with_name(name)
+        if candidate.exists():
+            return candidate
+    return None
+
+
+_WEBEXTENSION_PROPERTY_RE = re.compile(r"<(?:[A-Za-z_][\w.-]*:)?property\b([^>]*)>", re.I)
+_WEBEXTENSION_REFERENCE_RE = re.compile(r"<(?:[A-Za-z_][\w.-]*:)?reference\b([^>]*)>", re.I)
+_WEBEXTENSION_AI_VENDOR_PREFIXES = (
+    "anthropic.",
+    "chatgpt.",
+    "claude.",
+    "copilot.",
+    "gemini.",
+    "openai.",
+    "synthid.",
+)
+
+
+def _webextension_attribute_value(attributes: str, name: str) -> str | None:
+    pattern = re.compile(rf"\b{re.escape(name)}\s*=\s*([\"'])(.*?)\1", re.I)
+    match = pattern.search(attributes)
+    return match.group(2).strip() if match else None
+
+
+def _webextension_findings(name: str, raw: bytes) -> list[str]:
+    """Report Office add-in properties and references without scanning body text."""
+    text = raw.decode("utf-8", errors="replace")
+    findings: list[str] = []
+    for match in _WEBEXTENSION_PROPERTY_RE.finditer(text):
+        property_name = _webextension_attribute_value(match.group(1), "name") or ""
+        if not property_name:
+            continue
+        normalized = property_name.casefold()
+        vendor_property = any(
+            normalized.startswith(prefix) or f".{prefix}" in normalized
+            for prefix in _WEBEXTENSION_AI_VENDOR_PREFIXES
+        )
+        if vendor_property:
+            findings.append(f"{name}: web-extension vendor property {property_name}")
+        else:
+            findings.append(f"{name}: meta: web-extension property {property_name}")
+    for match in _WEBEXTENSION_REFERENCE_RE.finditer(text):
+        reference_id = _webextension_attribute_value(match.group(1), "id") or ""
+        if reference_id:
+            findings.append(f"{name}: meta: web-extension reference id={reference_id}")
+    return findings[:30]
 
 
 def _inspect_ooxml_zip(
@@ -2063,13 +2126,34 @@ def _inspect_ooxml_zip(
                 if not _is_docx_meta_part(name):
                     continue
                 raw = _read_zip_member(zf, info, budget)
+                webextension_part = _is_ooxml_webextension_part(name)
+                if webextension_part:
+                    webextension_hits = _webextension_findings(name, raw)
+                    if webextension_hits:
+                        has_ai = True
+                        findings.extend(webextension_hits)
                 c2, ai, hits = _blob_hits(raw)
+                if webextension_part and webextension_hits:
+                    # The structured finding already names a parsed vendor
+                    # property/reference. Avoid repeating the same vendor as
+                    # a weaker raw marker hit (e.g. "claude.fileId" plus
+                    # "ai:claude"). Keep unrelated markers and all C2PA hits.
+                    structured_text = " ".join(webextension_hits).casefold()
+                    hits = [
+                        hit
+                        for hit in hits
+                        if not (
+                            hit.lower().startswith("ai:")
+                            and hit.split(":", 1)[1].strip().casefold() in structured_text
+                        )
+                    ]
                 if c2 or ai:
                     if c2:
                         has_c2pa = True
                     if ai:
                         has_ai = True
-                    findings.append(f"{name}: {', '.join(hits[:6])}")
+                    if hits:
+                        findings.append(f"{name}: {', '.join(hits[:6])}")
             # always flag customXml presence lightly
             custom = [n for n in parts if n.startswith("customXml/")]
             if custom:
@@ -2556,6 +2640,13 @@ def _scrub_ooxml_zip(
                 actions.append(f"drop part {name}")
                 continue
 
+            # 2a. Office add-in state is stored outside the visible document
+            # body. Drop it from all supported OOXML packages; relationships
+            # to these parts are pruned after the archive is rewritten.
+            if _is_ooxml_webextension_part(name):
+                actions.append(f"drop Office web-extension part {name}")
+                continue
+
             # 3. docProps/ provenance
             if name in DOCX_META_PARTS or name.startswith("docProps/"):
                 if name.endswith("custom.xml"):
@@ -2605,6 +2696,15 @@ def _scrub_ooxml_zip(
                 )
                 if n:
                     actions.append(f"drop Content_Types custom.xml override x{n}")
+                    raw = new.encode("utf-8")
+                new, n = re.subn(
+                    r"""<Override\b(?=[^>]*\bPartName\s*=\s*["']/(?:word|xl|ppt)/webextensions/)[^>]*/>""",
+                    "",
+                    raw.decode("utf-8", errors="replace"),
+                    flags=re.I,
+                )
+                if n:
+                    actions.append(f"drop Content_Types web-extension overrides x{n}")
                     raw = new.encode("utf-8")
 
             # 5. Layer A text runs
@@ -4455,6 +4555,12 @@ def clean_container(
     data = path.read_bytes()
     fmt = fmt or detect_container_format(path, data)
     actions: list[str] = []
+    if fmt in {"docx", "xlsx", "pptx"}:
+        owner_file = office_owner_file(path)
+        if owner_file is not None:
+            raise ValueError(
+                f"refusing to clean an Office package while its owner file exists: {owner_file.name}"
+            )
     dest.parent.mkdir(parents=True, exist_ok=True)
     meta: dict[str, Any] = {"format": fmt}
 
