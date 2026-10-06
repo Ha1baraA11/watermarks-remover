@@ -14,6 +14,7 @@ sys.path.insert(0, str(SCRIPTS))
 
 from common import classify_finding_confidence
 from container_meta import (
+    _webextension_findings,
     clean_container,
     clean_docx,
     clean_pptx,
@@ -342,7 +343,7 @@ def test_clean_container_and_inspect_container_xlsx_pptx(tmp_path):
     assert out_path.exists()
 
 
-def _create_ooxml_with_webextensions(fmt: str) -> bytes:
+def _create_ooxml_with_webextensions(fmt: str, webextension_xml: str | None = None) -> bytes:
     """Build a small Office package with add-in metadata and visible content."""
     prefix, main_part, content_type, main_xml = {
         "docx": (
@@ -391,14 +392,63 @@ def _create_ooxml_with_webextensions(fmt: str) -> bytes:
         )
         zf.writestr(
             ext_path,
-            '<we:properties xmlns:we="http://schemas.microsoft.com/office/webextensions/webextension/2010/11">'
-            '<we:property name="claude.fileId" value="&quot;file-123&quot;"/>'
-            '<we:property name="otherAddin.setting" value="enabled"/>'
-            '<we:reference id="wa200010453"/>'
-            "</we:properties>",
+            (
+                webextension_xml
+                if webextension_xml is not None
+                else (
+                    '<we:properties xmlns:we="http://schemas.microsoft.com/office/webextensions/webextension/2010/11">'
+                    '<we:property name="claude.fileId" value="&quot;file-123&quot;"/>'
+                    '<we:property name="otherAddin.setting" value="enabled"/>'
+                    '<we:reference id="wa200010453"/>'
+                    "</we:properties>"
+                )
+            ),
         )
         zf.writestr(taskpanes_path, "<we:taskpanes/>")
     return buf.getvalue()
+
+
+def test_webextension_parser_handles_quoted_gt_and_ignores_comments():
+    raw = (
+        b'<we:properties xmlns:we="urn:office:webextension">'
+        b'<!-- <we:property name="openai.comment-only"/> -->'
+        b'<we:property value="a>b" name="other.setting"/>'
+        b'<we:reference id="reference>id"/>'
+        b"</we:properties>"
+    )
+
+    findings = _webextension_findings("word/webextensions/webextension1.xml", raw)
+
+    assert findings == [
+        "word/webextensions/webextension1.xml: meta: web-extension property other.setting",
+        "word/webextensions/webextension1.xml: meta: web-extension reference id=reference>id",
+    ]
+
+
+def test_webextension_parser_stops_at_finding_limit():
+    properties = "".join(f'<property name="other.setting{i}"/>' for i in range(35))
+    raw = f"<properties>{properties}</properties>".encode()
+
+    findings = _webextension_findings("word/webextensions/webextension1.xml", raw)
+
+    assert len(findings) == 30
+    assert findings[-1].endswith("other.setting29")
+
+
+def test_ooxml_inspector_flags_quoted_gt_property_without_raw_markers():
+    webextension_xml = (
+        '<we:properties xmlns:we="http://schemas.microsoft.com/office/webextensions/webextension/2010/11">'
+        '<we:property value="a>b" name="other.setting"/>'
+        "</we:properties>"
+    )
+
+    has_c2pa, has_ai, findings, _ = inspect_docx(
+        _create_ooxml_with_webextensions("docx", webextension_xml)
+    )
+
+    assert not has_c2pa
+    assert has_ai
+    assert any("web-extension property other.setting" in finding for finding in findings)
 
 
 def test_ooxml_webextension_metadata_inspect_and_clean():

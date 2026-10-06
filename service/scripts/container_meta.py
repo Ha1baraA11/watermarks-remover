@@ -2029,8 +2029,6 @@ def office_owner_file(path: Path) -> Path | None:
     return None
 
 
-_WEBEXTENSION_PROPERTY_RE = re.compile(r"<(?:[A-Za-z_][\w.-]*:)?property\b([^>]*)>", re.I)
-_WEBEXTENSION_REFERENCE_RE = re.compile(r"<(?:[A-Za-z_][\w.-]*:)?reference\b([^>]*)>", re.I)
 _WEBEXTENSION_AI_VENDOR_PREFIXES = (
     "anthropic.",
     "chatgpt.",
@@ -2042,34 +2040,66 @@ _WEBEXTENSION_AI_VENDOR_PREFIXES = (
 )
 
 
-def _webextension_attribute_value(attributes: str, name: str) -> str | None:
-    pattern = re.compile(rf"\b{re.escape(name)}\s*=\s*([\"'])(.*?)\1", re.I)
-    match = pattern.search(attributes)
-    return match.group(2).strip() if match else None
-
-
 def _webextension_findings(name: str, raw: bytes) -> list[str]:
     """Report Office add-in properties and references without scanning body text."""
-    text = raw.decode("utf-8", errors="replace")
+    from xml.parsers import expat
+
     findings: list[str] = []
-    for match in _WEBEXTENSION_PROPERTY_RE.finditer(text):
-        property_name = _webextension_attribute_value(match.group(1), "name") or ""
-        if not property_name:
-            continue
-        normalized = property_name.casefold()
-        vendor_property = any(
-            normalized.startswith(prefix) or f".{prefix}" in normalized
-            for prefix in _WEBEXTENSION_AI_VENDOR_PREFIXES
+
+    class _FindingLimitReached(Exception):
+        pass
+
+    class _DoctypeRejected(Exception):
+        pass
+
+    def on_start(tag: str, attributes: dict[str, str]) -> None:
+        local_tag = tag.rsplit(":", 1)[-1].casefold()
+        wanted_attribute = (
+            "name" if local_tag == "property" else "id" if local_tag == "reference" else None
         )
-        if vendor_property:
-            findings.append(f"{name}: web-extension vendor property {property_name}")
+        if wanted_attribute is None:
+            return
+        value = next(
+            (
+                attribute_value.strip()
+                for attribute, attribute_value in attributes.items()
+                if attribute.rsplit(":", 1)[-1].casefold() == wanted_attribute
+            ),
+            "",
+        )
+        if not value:
+            return
+
+        if local_tag == "property":
+            normalized = value.casefold()
+            vendor_property = any(
+                normalized.startswith(prefix) or f".{prefix}" in normalized
+                for prefix in _WEBEXTENSION_AI_VENDOR_PREFIXES
+            )
+            if vendor_property:
+                findings.append(f"{name}: web-extension vendor property {value}")
+            else:
+                findings.append(f"{name}: meta: web-extension property {value}")
         else:
-            findings.append(f"{name}: meta: web-extension property {property_name}")
-    for match in _WEBEXTENSION_REFERENCE_RE.finditer(text):
-        reference_id = _webextension_attribute_value(match.group(1), "id") or ""
-        if reference_id:
-            findings.append(f"{name}: meta: web-extension reference id={reference_id}")
-    return findings[:30]
+            findings.append(f"{name}: meta: web-extension reference id={value}")
+        if len(findings) >= 30:
+            raise _FindingLimitReached
+
+    def reject_doctype(*_args) -> None:
+        # Office web-extension parts do not need DTDs or entities. Reject them
+        # before Expat can expand attacker-controlled declarations.
+        raise _DoctypeRejected
+
+    parser = expat.ParserCreate()
+    parser.StartElementHandler = on_start
+    parser.StartDoctypeDeclHandler = reject_doctype
+    parser.SetParamEntityParsing(expat.XML_PARAM_ENTITY_PARSING_NEVER)
+    parser.ExternalEntityRefHandler = lambda *_args: 0
+    with contextlib.suppress(_FindingLimitReached, _DoctypeRejected, expat.ExpatError):
+        parser.Parse(raw, True)
+    # Malformed parts keep any findings parsed before the error. Most
+    # importantly, reaching the report cap stops parsing immediately.
+    return findings
 
 
 def _inspect_ooxml_zip(
