@@ -12,6 +12,7 @@ SCRIPTS = ROOT / "service" / "scripts"
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(SCRIPTS))
 
+import container_meta as container_meta_module
 from common import classify_finding_confidence
 from container_meta import (
     clean_container,
@@ -441,3 +442,75 @@ def test_ooxml_webextension_metadata_inspect_and_clean():
             assert "webextensions/" not in rels
             main_xml = zf.read(body_parts[fmt][0]).decode("utf-8")
             assert body_parts[fmt][1] in main_xml
+
+
+def test_webextension_findings_parse_comments_and_quoted_gt_attributes():
+    raw = (
+        b'<we:properties xmlns:we="urn:example">'
+        b'<!-- <we:property name="claude.decoy" value="ignored"/> -->'
+        b'<we:property value="left > right" name="claude.real"/>'
+        b"</we:properties>"
+    )
+
+    findings = container_meta_module._webextension_findings(
+        "word/webextensions/webextension1.xml", raw
+    )
+
+    assert findings == [
+        "word/webextensions/webextension1.xml: web-extension vendor property claude.real"
+    ]
+
+
+def test_webextension_findings_stop_parsing_at_thirty(monkeypatch):
+    raw = (
+        "<properties>"
+        + "".join(f'<property name="claude.{index}"/>' for index in range(40))
+        + "</properties>"
+    ).encode()
+    original_parser_create = container_meta_module.expat.ParserCreate
+    starts_seen = 0
+
+    class CountingParser:
+        def __init__(self, parser):
+            object.__setattr__(self, "_parser", parser)
+
+        def __getattr__(self, attribute):
+            return getattr(self._parser, attribute)
+
+        def __setattr__(self, attribute, value):
+            if attribute == "_parser":
+                object.__setattr__(self, attribute, value)
+            elif attribute == "StartElementHandler":
+
+                def counted_start(*args):
+                    nonlocal starts_seen
+                    starts_seen += 1
+                    return value(*args)
+
+                setattr(self._parser, attribute, counted_start)
+            else:
+                setattr(self._parser, attribute, value)
+
+    monkeypatch.setattr(
+        container_meta_module.expat,
+        "ParserCreate",
+        lambda *args, **kwargs: CountingParser(original_parser_create(*args, **kwargs)),
+    )
+
+    findings = container_meta_module._webextension_findings(
+        "word/webextensions/webextension1.xml", raw
+    )
+
+    assert len(findings) == 30
+    assert starts_seen == 31
+
+
+def test_webextension_findings_reject_doctype_declarations():
+    raw = (
+        b'<!DOCTYPE properties [<!ENTITY property "claude.injected">]>'
+        b'<properties><property name="claude.real"/></properties>'
+    )
+
+    assert not container_meta_module._webextension_findings(
+        "word/webextensions/webextension1.xml", raw
+    )

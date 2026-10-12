@@ -23,6 +23,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from xml.parsers import expat
 
 from common import (
     c2patool_probe_note,
@@ -2029,8 +2030,7 @@ def office_owner_file(path: Path) -> Path | None:
     return None
 
 
-_WEBEXTENSION_PROPERTY_RE = re.compile(r"<(?:[A-Za-z_][\w.-]*:)?property\b([^>]*)>", re.I)
-_WEBEXTENSION_REFERENCE_RE = re.compile(r"<(?:[A-Za-z_][\w.-]*:)?reference\b([^>]*)>", re.I)
+_WEBEXTENSION_MAX_FINDINGS = 30
 _WEBEXTENSION_AI_VENDOR_PREFIXES = (
     "anthropic.",
     "chatgpt.",
@@ -2042,34 +2042,56 @@ _WEBEXTENSION_AI_VENDOR_PREFIXES = (
 )
 
 
-def _webextension_attribute_value(attributes: str, name: str) -> str | None:
-    pattern = re.compile(rf"\b{re.escape(name)}\s*=\s*([\"'])(.*?)\1", re.I)
-    match = pattern.search(attributes)
-    return match.group(2).strip() if match else None
+class _WebExtensionFindingsLimitReached(Exception):
+    pass
+
+
+class _WebExtensionDoctypeRejected(Exception):
+    pass
 
 
 def _webextension_findings(name: str, raw: bytes) -> list[str]:
     """Report Office add-in properties and references without scanning body text."""
-    text = raw.decode("utf-8", errors="replace")
     findings: list[str] = []
-    for match in _WEBEXTENSION_PROPERTY_RE.finditer(text):
-        property_name = _webextension_attribute_value(match.group(1), "name") or ""
-        if not property_name:
-            continue
-        normalized = property_name.casefold()
-        vendor_property = any(
-            normalized.startswith(prefix) or f".{prefix}" in normalized
-            for prefix in _WEBEXTENSION_AI_VENDOR_PREFIXES
-        )
-        if vendor_property:
-            findings.append(f"{name}: web-extension vendor property {property_name}")
-        else:
-            findings.append(f"{name}: meta: web-extension property {property_name}")
-    for match in _WEBEXTENSION_REFERENCE_RE.finditer(text):
-        reference_id = _webextension_attribute_value(match.group(1), "id") or ""
-        if reference_id:
-            findings.append(f"{name}: meta: web-extension reference id={reference_id}")
-    return findings[:30]
+
+    def on_start(tag: str, attributes: dict[str, str]) -> None:
+        local_name = tag.rsplit("}", 1)[-1].casefold()
+        attributes_by_name = {
+            key.rsplit("}", 1)[-1].casefold(): value.strip() for key, value in attributes.items()
+        }
+        if local_name == "property":
+            property_name = attributes_by_name.get("name", "")
+            if property_name:
+                normalized = property_name.casefold()
+                vendor_property = any(
+                    normalized.startswith(prefix) or f".{prefix}" in normalized
+                    for prefix in _WEBEXTENSION_AI_VENDOR_PREFIXES
+                )
+                if vendor_property:
+                    findings.append(f"{name}: web-extension vendor property {property_name}")
+                else:
+                    findings.append(f"{name}: meta: web-extension property {property_name}")
+        elif local_name == "reference":
+            reference_id = attributes_by_name.get("id", "")
+            if reference_id:
+                findings.append(f"{name}: meta: web-extension reference id={reference_id}")
+        if len(findings) >= _WEBEXTENSION_MAX_FINDINGS:
+            raise _WebExtensionFindingsLimitReached
+
+    def reject_doctype(*_args: object) -> None:
+        raise _WebExtensionDoctypeRejected
+
+    parser = expat.ParserCreate(namespace_separator="}")
+    parser.SetParamEntityParsing(expat.XML_PARAM_ENTITY_PARSING_NEVER)
+    parser.StartElementHandler = on_start
+    parser.StartDoctypeDeclHandler = reject_doctype
+    with contextlib.suppress(
+        _WebExtensionFindingsLimitReached,
+        _WebExtensionDoctypeRejected,
+        expat.ExpatError,
+    ):
+        parser.Parse(raw, True)
+    return findings
 
 
 def _inspect_ooxml_zip(
