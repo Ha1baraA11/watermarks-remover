@@ -19,11 +19,11 @@ import time
 import urllib.parse
 import zipfile
 import zlib
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
-from xml.parsers import expat
+from xml.etree import ElementTree as ET
 
 from common import (
     c2patool_probe_note,
@@ -2050,6 +2050,28 @@ class _WebExtensionDoctypeRejected(Exception):
     pass
 
 
+class _WebExtensionFindingsTarget:
+    """Stream XML start events without building a document tree."""
+
+    def __init__(self, on_start: Callable[[str, dict[str, str]], None]) -> None:
+        self._on_start = on_start
+
+    def start(self, tag: str, attributes: dict[str, str]) -> None:
+        self._on_start(tag, attributes)
+
+    def end(self, _tag: str) -> None:
+        pass
+
+    def data(self, _text: str) -> None:
+        pass
+
+    def doctype(self, *_args: object) -> None:
+        raise _WebExtensionDoctypeRejected
+
+    def close(self) -> None:
+        return None
+
+
 def _webextension_findings(name: str, raw: bytes) -> list[str]:
     """Report Office add-in properties and references without scanning body text."""
     findings: list[str] = []
@@ -2078,19 +2100,15 @@ def _webextension_findings(name: str, raw: bytes) -> list[str]:
         if len(findings) >= _WEBEXTENSION_MAX_FINDINGS:
             raise _WebExtensionFindingsLimitReached
 
-    def reject_doctype(*_args: object) -> None:
-        raise _WebExtensionDoctypeRejected
-
-    parser = expat.ParserCreate(namespace_separator="}")
-    parser.SetParamEntityParsing(expat.XML_PARAM_ENTITY_PARSING_NEVER)
-    parser.StartElementHandler = on_start
-    parser.StartDoctypeDeclHandler = reject_doctype
+    # The target rejects DOCTYPE declarations before entity declarations can be used.
+    parser = ET.XMLParser(target=_WebExtensionFindingsTarget(on_start))  # noqa: S314
     with contextlib.suppress(
         _WebExtensionFindingsLimitReached,
         _WebExtensionDoctypeRejected,
-        expat.ExpatError,
+        ET.ParseError,
     ):
-        parser.Parse(raw, True)
+        parser.feed(raw)
+        parser.close()
     return findings
 
 
@@ -2152,7 +2170,9 @@ def _inspect_ooxml_zip(
                 if webextension_part:
                     webextension_hits = _webextension_findings(name, raw)
                     if webextension_hits:
-                        if any("web-extension vendor property " in hit for hit in webextension_hits):
+                        if any(
+                            "web-extension vendor property " in hit for hit in webextension_hits
+                        ):
                             has_ai = True
                         findings.extend(webextension_hits)
                 c2, ai, hits = _blob_hits(raw)

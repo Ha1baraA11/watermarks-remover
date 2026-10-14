@@ -529,41 +529,37 @@ def test_webextension_findings_parse_comments_and_quoted_gt_attributes():
     ]
 
 
+def test_webextension_findings_parse_quoted_attribute_entities():
+    raw = (
+        b'<properties><property name="claude.real&quot;quoted" '
+        b'value="left &quot; quoted"/></properties>'
+    )
+
+    findings = container_meta_module._webextension_findings(
+        "word/webextensions/webextension1.xml", raw
+    )
+
+    assert findings == [
+        'word/webextensions/webextension1.xml: web-extension vendor property claude.real"quoted'
+    ]
+
+
 def test_webextension_findings_stop_parsing_at_thirty(monkeypatch):
     raw = (
         "<properties>"
         + "".join(f'<property name="claude.{index}"/>' for index in range(40))
         + "</properties>"
     ).encode()
-    original_parser_create = container_meta_module.expat.ParserCreate
+    original_target = container_meta_module._WebExtensionFindingsTarget
     starts_seen = 0
 
-    class CountingParser:
-        def __init__(self, parser):
-            object.__setattr__(self, "_parser", parser)
+    class CountingTarget(original_target):
+        def start(self, tag, attributes):
+            nonlocal starts_seen
+            starts_seen += 1
+            return super().start(tag, attributes)
 
-        def __getattr__(self, attribute):
-            return getattr(self._parser, attribute)
-
-        def __setattr__(self, attribute, value):
-            if attribute == "_parser":
-                object.__setattr__(self, attribute, value)
-            elif attribute == "StartElementHandler":
-
-                def counted_start(*args):
-                    nonlocal starts_seen
-                    starts_seen += 1
-                    return value(*args)
-
-                setattr(self._parser, attribute, counted_start)
-            else:
-                setattr(self._parser, attribute, value)
-
-    monkeypatch.setattr(
-        container_meta_module.expat,
-        "ParserCreate",
-        lambda *args, **kwargs: CountingParser(original_parser_create(*args, **kwargs)),
-    )
+    monkeypatch.setattr(container_meta_module, "_WebExtensionFindingsTarget", CountingTarget)
 
     findings = container_meta_module._webextension_findings(
         "word/webextensions/webextension1.xml", raw
