@@ -436,7 +436,7 @@ def test_webextension_parser_stops_at_finding_limit():
     assert findings[-1].endswith("other.setting29")
 
 
-def test_ooxml_inspector_flags_quoted_gt_property_without_raw_markers():
+def test_ooxml_inspector_reports_quoted_gt_property_without_raw_markers():
     webextension_xml = (
         '<we:properties xmlns:we="http://schemas.microsoft.com/office/webextensions/webextension/2010/11">'
         '<we:property value="a>b" name="other.setting"/>'
@@ -448,8 +448,26 @@ def test_ooxml_inspector_flags_quoted_gt_property_without_raw_markers():
     )
 
     assert not has_c2pa
-    assert has_ai
+    assert not has_ai
     assert any("web-extension property other.setting" in finding for finding in findings)
+
+
+def test_ooxml_inspector_keeps_probable_webextension_metadata_unconfirmed():
+    webextension_xml = (
+        '<we:properties xmlns:we="http://schemas.microsoft.com/office/webextensions/webextension/2010/11">'
+        '<we:property name="otherAddin.setting" value="enabled"/>'
+        '<we:reference id="wa200010453"/>'
+        "</we:properties>"
+    )
+
+    has_c2pa, has_ai, findings, _ = inspect_docx(
+        _create_ooxml_with_webextensions("docx", webextension_xml)
+    )
+
+    assert not has_c2pa
+    assert not has_ai
+    assert any("meta: web-extension property otherAddin.setting" in finding for finding in findings)
+    assert any("meta: web-extension reference id=wa200010453" in finding for finding in findings)
 
 
 def test_ooxml_webextension_metadata_inspect_and_clean():

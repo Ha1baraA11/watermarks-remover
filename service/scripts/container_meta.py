@@ -2152,7 +2152,8 @@ def _inspect_ooxml_zip(
                 if webextension_part:
                     webextension_hits = _webextension_findings(name, raw)
                     if webextension_hits:
-                        has_ai = True
+                        if any("web-extension vendor property " in hit for hit in webextension_hits):
+                            has_ai = True
                         findings.extend(webextension_hits)
                 c2, ai, hits = _blob_hits(raw)
                 if webextension_part and webextension_hits:
